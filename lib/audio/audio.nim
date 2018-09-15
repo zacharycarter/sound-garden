@@ -29,7 +29,6 @@ let sizeOfSample = sizeof float
 proc writeCallback(outStream: ptr SoundIoOutStream, frameCountMin: cint, frameCountMax: cint) {.cdecl.} =
   let userdata = cast[ptr UserData](outStream.userdata)
   let monitor = userdata.monitor
-  let input = userdata.input
   let ctx = userdata.context
   let signal = userdata.signal.f
   let channelCount = outStream.layout.channelCount
@@ -48,13 +47,12 @@ proc writeCallback(outStream: ptr SoundIoOutStream, frameCountMin: cint, frameCo
 
     let ptrAreas = cast[int](areas)
     let ptrMonitor = cast[int](monitor.writePtr)
-    let ptrInput = cast[int](input.readPtr)
 
     for frame in 0..<frameCount:
       let offset = frame * channelCount
       for channel in 0..<channelCount:
         ctx.channel = channel
-        ctx.input = cast[ptr float](ptrInput + (offset + channel) * sizeOfSample)[]
+        ctx.input = 0
 
         let ptrArea = cast[ptr SoundIoChannelArea](ptrAreas + channel*sizeOfChannelArea)
         var ptrSample = cast[ptr float32](cast[int](ptrArea.pointer) + frame*ptrArea.step)
@@ -67,7 +65,6 @@ proc writeCallback(outStream: ptr SoundIoOutStream, frameCountMin: cint, frameCo
 
     let bytesProcessed = cint(frameCount * channelCount * sizeOfSample)
     monitor.advanceWritePtr(bytesProcessed)
-    input.advanceReadPtr(bytesProcessed)
 
     err = outStream.endWrite
     if err > 0 and err != cint(SoundIoError.Underflow):
@@ -175,44 +172,13 @@ proc newSoundSystem*(): Result[SoundSystem] =
     value: SoundSystem(sio: sio, inDevice: inDevice, outDevice: outDevice))
 
 proc newIOStream*(ss: SoundSystem): Result[IOStream] =
-  ss.outDevice.sortChannelLayouts
-  let layout = bestMatchingChannelLayout(
-    ss.outDevice.layouts, ss.outDevice.layoutCount,
-    ss.inDevice.layouts, ss.inDevice.layoutCount,
-  )
-  if layout.isNil:
-    return ioserr "Channel layouts not compatible"
-
-  var sampleRate: cint
-  for sr in SAMPLE_RATES:
-    let csr = cast[cint](sr)
-    if ss.inDevice.supportsSampleRate(csr) and ss.outDevice.supportsSampleRate(csr):
-      sampleRate = csr
-      break
-
-  if sampleRate == 0:
-    return ioserr "Incompatible sound rates"
-
   let inStream = ss.inDevice.inStreamCreate
-  inStream.format = SAMPLE_FORMAT
-  inStream.sampleRate = sampleRate
-  inStream.layout = layout[]
-  inStream.readCallback = readCallback
-
-  var err = inStream.open
-  if err > 0:
-    return ioserr "Unable to open input device: " & $err.strerror
-
-  if inStream.layoutError > 0:
-    return ioserr "Unable to set input channel layout: " & $inStream.layoutError.strerror
 
   let outStream = ss.outDevice.outStreamCreate
   outStream.format = SAMPLE_FORMAT
-  outStream.sampleRate = sampleRate
-  outStream.layout = layout[]
   outStream.writeCallback = writeCallback
 
-  err = outStream.open
+  var err = outStream.open
   if err > 0:
     return ioserr "Unable to open output device: " & $err.strerror
 
@@ -223,7 +189,7 @@ proc newIOStream*(ss: SoundSystem): Result[IOStream] =
   inStream.userdata = ptrUserdata
   outStream.userdata = ptrUserdata
 
-  var ctx = Context(channel: 0, sampleNumber: 0, sampleRate: sampleRate)
+  var ctx = Context(channel: 0, sampleNumber: 0, sampleRate: outStream.sampleRate)
   var silence = 0.toSignal
 
   GC_ref ctx
@@ -233,15 +199,9 @@ proc newIOStream*(ss: SoundSystem): Result[IOStream] =
   userdata.context = ctx
   userdata.signal = silence
   userdata.monitor = ss.sio.ringBufferCreate(cast[cint](
-    MONITOR_MAX_DUR * sampleRate * layout.channelCount * sizeOfSample
+    MONITOR_MAX_DUR * outStream.sampleRate * outStream.layout.channelCount * sizeOfSample
   ))
-  userdata.input = ss.sio.ringBufferCreate(cast[cint]((
-    inStream.softwareLatency * (4 * sampleRate * layout.channelCount * sizeOfSample).toFloat
-  ).toInt))
-
-  err = inStream.start
-  if err > 0:
-    return ioserr "Unable to start input stream: " & $err.strerror
+  userdata.input = ss.sio.ringBufferCreate(cast[cint](2))
 
   err = outStream.start
   if err > 0:
